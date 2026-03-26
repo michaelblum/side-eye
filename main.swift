@@ -125,6 +125,10 @@ func parseHexColor(_ hex: String) -> CGColor {
     guard h.count == 6 || h.count == 8 else {
         exitError("Invalid color '\(hex)'. Use #RRGGBB or #RRGGBBAA.", code: "INVALID_COLOR")
     }
+    // Validate all characters are hex digits
+    guard h.allSatisfy({ $0.isHexDigit }) else {
+        exitError("Invalid color '\(hex)'. Contains non-hex characters.", code: "INVALID_COLOR")
+    }
     let scanner = Scanner(string: h)
     var value: UInt64 = 0
     scanner.scanHexInt64(&value)
@@ -782,15 +786,24 @@ func zoneCommand(args: [String]) {
         guard let targetDisplay = resolveDisplayTarget(target, displays: displays) else {
             exitError("Cannot resolve display '\(target)'", code: "NO_DISPLAY")
         }
-        guard let rect = showInteractiveSelection(on: targetDisplay, timeout: 120) else {
-            exitError("Interactive zone definition cancelled or timed out", code: "SELECTION_CANCELLED")
+
+        // Try native overlay first (works from real terminals like iTerm/Terminal.app).
+        // Falls back to error with guidance if overlay can't acquire focus (e.g. sandboxed contexts).
+        if let rect = showInteractiveSelection(on: targetDisplay, timeout: 120) {
+            let scale = targetDisplay.scaleFactor
+            let cropStr = "\(Int(rect.origin.x * scale)),\(Int(rect.origin.y * scale)),\(Int(rect.width * scale)),\(Int(rect.height * scale))"
+            var zones = loadZones()
+            zones[name] = ZoneEntry(target: target, crop: cropStr)
+            saveZones(zones)
+            print(jsonString(["status": "saved", "zone": name, "bounds": cropStr]))
+        } else {
+            exitError(
+                "Interactive overlay timed out (window could not acquire focus). "
+                + "Use 'side-eye zone save \(name) --target \(target) --bounds x,y,w,h' instead, "
+                + "or run 'side-eye capture \(target) --interactive --grid 10x10' to identify coordinates visually.",
+                code: "INTERACTIVE_UNAVAILABLE"
+            )
         }
-        let scale = targetDisplay.scaleFactor
-        let cropStr = "\(Int(rect.origin.x * scale)),\(Int(rect.origin.y * scale)),\(Int(rect.width * scale)),\(Int(rect.height * scale))"
-        var zones = loadZones()
-        zones[name] = ZoneEntry(target: target, crop: cropStr)
-        saveZones(zones)
-        print(jsonString(["status": "saved", "zone": name, "bounds": cropStr]))
 
     case "delete":
         guard args.count >= 2 else { exitError("Usage: side-eye zone delete <name>", code: "MISSING_ARG") }
@@ -810,6 +823,12 @@ func zoneCommand(args: [String]) {
 
 /// Block until a global left-click occurs. Returns click position in CG screen coords (top-left origin).
 func waitForGlobalClick(timeout: Double) -> CGPoint {
+    // Must run on main thread for NSEvent global monitor.
+    if !Thread.isMainThread {
+        var result: CGPoint = .zero
+        DispatchQueue.main.sync { result = waitForGlobalClick(timeout: timeout) }
+        return result
+    }
     checkAccessibilityPermission()
 
     var clickPoint: CGPoint? = nil
@@ -837,6 +856,12 @@ func waitForGlobalClick(timeout: Double) -> CGPoint {
 
 // MARK: - Interactive Selection
 
+/// Borderless windows can't become key by default. Override to allow event delivery.
+class KeyableWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 class SelectionOverlayView: NSView {
     var startPoint: NSPoint = .zero
     var currentPoint: NSPoint = .zero
@@ -846,6 +871,7 @@ class SelectionOverlayView: NSView {
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     var selectionRect: NSRect {
         let x = min(startPoint.x, currentPoint.x)
@@ -915,7 +941,14 @@ class SelectionOverlayView: NSView {
 }
 
 func showInteractiveSelection(on display: DisplayEntry, timeout: Double = 60) -> NSRect? {
-    NSApp.setActivationPolicy(.accessory)
+    // Must run on main thread for NSWindow. If called from background (async context),
+    // dispatch synchronously to main queue.
+    if !Thread.isMainThread {
+        var result: NSRect? = nil
+        DispatchQueue.main.sync { result = showInteractiveSelection(on: display, timeout: timeout) }
+        return result
+    }
+    NSApp.setActivationPolicy(.regular)
 
     let nsScreen = NSScreen.screens.first { screen in
         (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == display.cgID
@@ -929,22 +962,31 @@ func showInteractiveSelection(on display: DisplayEntry, timeout: Double = 60) ->
     var done = false
     let deadline = Date(timeIntervalSinceNow: timeout)
 
-    let window = NSWindow(contentRect: windowRect, styleMask: .borderless, backing: .buffered, defer: false)
+    let window = KeyableWindow(contentRect: windowRect, styleMask: .borderless, backing: .buffered, defer: false)
     window.level = .screenSaver
-    window.backgroundColor = .clear
+    window.backgroundColor = NSColor(calibratedWhite: 0, alpha: 0.3)  // Visible immediately
     window.isOpaque = false
     window.hasShadow = false
+    window.ignoresMouseEvents = false
+    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
     let overlay = SelectionOverlayView(frame: window.contentView!.bounds)
     overlay.autoresizingMask = [.width, .height]
+    overlay.wantsLayer = true  // Ensure layer-backed for reliable drawing
     window.contentView?.addSubview(overlay)
 
     overlay.onComplete = { rect in result = rect; done = true }
     overlay.onCancel = { done = true }
 
-    window.makeKeyAndOrderFront(nil)
+    window.orderFrontRegardless()
+    window.makeKey()
     window.makeFirstResponder(overlay)
-    NSApp.activate(ignoringOtherApps: true)
+    NSRunningApplication.current.activate(options: [.activateAllWindows])
+
+    // Force initial draw + process activation events
+    overlay.needsDisplay = true
+    RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+    NSCursor.crosshair.push()
 
     while !done && Date() < deadline {
         autoreleasepool {
@@ -952,6 +994,7 @@ func showInteractiveSelection(on display: DisplayEntry, timeout: Double = 60) ->
         }
     }
 
+    NSCursor.pop()
     window.orderOut(nil)
     NSApp.setActivationPolicy(.prohibited)
     return done ? result : nil
@@ -961,56 +1004,71 @@ func showInteractiveSelection(on display: DisplayEntry, timeout: Double = 60) ->
 
 func printUsage() {
     print("""
-    side-eye — Agent-first macOS screenshot CLI
+    side-eye — Agent-first macOS screenshot CLI  (v3)
 
-    USAGE:
-      side-eye list                            Display topology as JSON
-      side-eye capture <target> [options]      Take a screenshot
-      side-eye <target> [options]              Shorthand for capture
-      side-eye zone save <name> [--target <t>] [--bounds] <x,y,w,h>
-      side-eye zone define <name> [--target <t>]   Interactive zone definition
-      side-eye zone list                       List saved zones
-      side-eye zone delete <name>              Delete a zone
-      side-eye <zone-name> [options]           Capture using saved zone
+    USAGE
+      side-eye list                              Display topology as JSON
+      side-eye [capture] <target> [options]      Take a screenshot
+      side-eye zone <save|define|list|delete>    Manage named zones
+      side-eye <zone-name> [options]             Capture a saved zone
 
-    TARGETS:
-      main, center, middle    Primary display
-      external                First external display
-      external 1              Leftmost external display
-      external 2              Next external display
-      user_active             Display with the focused app
-      selfie                  Display hosting this process
+    TARGETS
+      main, center, middle    Primary display (Retina MacBook)
+      external                First external monitor
+      external 1              Leftmost external (by X coordinate)
+      external 2              Next external moving right
+      user_active             Display with the focused application
+      selfie                  Display hosting this CLI process
       mouse                   Display containing the cursor
-      all                     Every connected display
+      all                     Every connected display (one file each)
 
-    OPTIONS:
-      --window                Capture only the targeted window
-      --out <path>            Output path (default: ./screenshot.<format>)
-      --base64                Output base64 JSON instead of writing file
-      --crop <style>          Crop region (named style or x,y,w,h)
-      --format <ext>          png (default), jpg, heic
-      --quality <level>       high (default), med, low
-      --show-cursor           Include system cursor in capture
-      --highlight-cursor [#color]  Draw translucent circle at cursor position
-      --radius <px>           With 'mouse' target: capture box centered on cursor
-      --interactive           Drag to select capture region
-      --wait-for-click        Wait for left-click, then capture (returns click_x/y)
+    OUTPUT
+      --out <path>            File path (default: ./screenshot.<format>)
+      --base64                Skip disk I/O; emit base64 string in JSON
+      --format <ext>          png (default), jpg/jpeg, heic
+      --quality <level>       high (1.0, default), med (0.6), low (0.3)
+      --clipboard             Also copy final image to system clipboard
+
+    CAPTURE MODIFIERS
+      --window                Capture the targeted window, not the full display
+      --crop <style>          Crop: named style or exact x,y,w,h
+      --show-cursor           Include the system cursor in the capture
+      --delay <secs>          Sleep N seconds before capturing
+
+    INTERACTIVE & MOUSE
+      --interactive           Native macOS crosshair; drag to select region
+      --wait-for-click        Block until left-click; returns click_x/y in JSON
       --timeout <secs>        Timeout for interactive flags (default: 60)
-      --delay <secs>          Wait before capturing
-      --clipboard             Also copy image to system clipboard
-      --grid <CxR>            Draw coordinate grid (e.g., 4x3)
-      --draw-rect <x,y,w,h> <#color>       Draw stroke rectangle
-      --draw-rect-fill <x,y,w,h> <#color>  Draw filled rectangle
-      --thickness <px>        Line width for overlays (default: 2)
-      --shadow <ox,oy,blur,#color>  Drop shadow on drawn elements
+      mouse                   Target: resolves to display under cursor
+      --radius <px>           With 'mouse': capture <px>-radius box around cursor
+      --highlight-cursor [#color]   Draw 50px circle at cursor (default: #FFFF0066)
 
-    COORDINATE SYSTEM:
-      All coordinates are LOCAL to the captured target.
+    OVERLAYS (baked into the image via CoreGraphics)
+      --grid <CxR>            Coordinate grid, e.g. 10x10 — aids LLM spatial reasoning
+      --draw-rect <x,y,w,h> <#color>       Stroke bounding box
+      --draw-rect-fill <x,y,w,h> <#color>  Filled/translucent bounding box
+      --thickness <px>        Stroke width for grid/rects (default: 2)
+      --shadow <ox,oy,blur,#color>  Drop shadow on all drawn elements
+
+    ZONE MEMORY (~/.config/side-eye/zones.json)
+      zone save <name> [--target <t>] [--bounds] <x,y,w,h>
+      zone define <name> [--target <t>]    Interactive zone selection
+      zone list                             Dump all zones as JSON
+      zone delete <name>                    Remove a zone
+
+    COORDINATE SYSTEM (Local Coordinate System / LCS)
+      All coordinates are LOCAL to the captured target image.
       (0,0) = top-left of whatever you're capturing.
-      Overlays (--draw-rect, --grid) use post-crop coordinates.
+      Overlays (--draw-rect, --grid, --crop) use post-crop pixel coordinates.
+      This means an AI agent never needs global screen arithmetic.
 
-    COLORS:
-      #RRGGBB or #RRGGBBAA (e.g., #FF0000 or #FF000080)
+    COLORS
+      #RRGGBB or #RRGGBBAA (hex). Example: #FF000080 = red at 50% alpha.
+
+    JSON OUTPUT
+      Success:  {"status":"success", "files":[...], "base64":[...], ...}
+      Failure:  exit 1, stderr: {"error":"...", "code":"PERMISSION_DENIED"}
+      Optional keys: cursor{x,y}, bounds{x,y,w,h}, click_x, click_y, warning
     """)
 }
 
@@ -1142,23 +1200,32 @@ func captureCommand(args: [String]) async {
         exitError("Unknown target: '\(opts.target)'", code: "UNKNOWN_TARGET")
     }
 
-    // ── Interactive selection ──
+    // ── Interactive selection (via native screencapture -i) ──
     var interactiveBounds: BoundsJSON? = nil
+    var interactiveImage: CGImage? = nil
     if opts.interactive {
-        guard let firstID = targetDisplayIDs.first,
-              let targetDisplay = displays.first(where: { $0.cgID == firstID }) else {
-            exitError("Cannot determine display for interactive selection", code: "NO_DISPLAY")
+        let tmpPath = NSTemporaryDirectory() + "side-eye-interactive-\(ProcessInfo.processInfo.processIdentifier).png"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        proc.arguments = ["-i", "-x", tmpPath]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch {
+            exitError("Failed to launch screencapture: \(error.localizedDescription)", code: "INTERACTIVE_FAILED")
         }
-        guard let rect = showInteractiveSelection(on: targetDisplay, timeout: opts.timeout) else {
-            exitError("Interactive selection cancelled or timed out", code: "SELECTION_CANCELLED")
+        proc.waitUntilExit()
+
+        guard proc.terminationStatus == 0,
+              let dataProvider = CGDataProvider(url: URL(fileURLWithPath: tmpPath) as CFURL),
+              let img = CGImage(pngDataProviderSource: dataProvider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else {
+            try? FileManager.default.removeItem(atPath: tmpPath)
+            exitError("Interactive selection cancelled", code: "SELECTION_CANCELLED")
         }
-        let scale = targetDisplay.scaleFactor
-        let px = Int(rect.origin.x * scale)
-        let py = Int(rect.origin.y * scale)
-        let pw = Int(rect.width * scale)
-        let ph = Int(rect.height * scale)
-        opts.crop = "\(px),\(py),\(pw),\(ph)"
-        interactiveBounds = BoundsJSON(x: 0, y: 0, width: pw, height: ph)
+        try? FileManager.default.removeItem(atPath: tmpPath)
+
+        interactiveImage = img
+        interactiveBounds = BoundsJSON(x: 0, y: 0, width: img.width, height: img.height)
     }
 
     // ── Capture loop ──
@@ -1167,7 +1234,21 @@ func captureCommand(args: [String]) async {
     var responseClickX: Int? = nil
     var responseClickY: Int? = nil
 
+    // If interactive captured an image, use it directly (skip display/window capture)
+    if let iImg = interactiveImage {
+        var finalImage = iImg
+        // Apply overlays to interactive image
+        if let grid = opts.grid {
+            finalImage = drawGrid(on: finalImage, spec: grid, thickness: opts.thickness, shadow: opts.shadow)
+        }
+        if !opts.drawRects.isEmpty {
+            finalImage = drawRects(on: finalImage, rects: opts.drawRects, thickness: opts.thickness, shadow: opts.shadow)
+        }
+        results.append((finalImage, opts.resolvedOutputPath))
+    }
+
     for (idx, cgID) in targetDisplayIDs.enumerated() {
+        if interactiveImage != nil { break }  // Already handled above
         guard let entry = displays.first(where: { $0.cgID == cgID }) else { continue }
         var image: CGImage
 
@@ -1332,36 +1413,56 @@ func captureCommand(args: [String]) async {
 }
 
 // MARK: - Entry Point
+//
+// The main thread must stay free for AppKit (NSWindow, NSEvent monitors, RunLoop pumping).
+// Async work (ScreenCaptureKit) runs on a detached Task. The main thread pumps the RunLoop
+// while waiting, so DispatchQueue.main.sync calls from background threads can execute.
 
 @available(macOS 14.0, *)
 @main
 struct SideEye {
-    static func main() async {
+    static func main() {
         _ = NSApplication.shared
 
         let args = Array(CommandLine.arguments.dropFirst())
         guard !args.isEmpty else { printUsage(); exit(0) }
 
+        // Synchronous commands — run directly on main thread
         switch args[0] {
         case "list":
-            listCommand()
-        case "capture":
-            await captureCommand(args: Array(args.dropFirst()))
+            listCommand(); exit(0)
         case "zone":
-            zoneCommand(args: Array(args.dropFirst()))
+            zoneCommand(args: Array(args.dropFirst())); exit(0)
         case "help", "--help", "-h":
-            printUsage()
+            printUsage(); exit(0)
         default:
-            if knownTargets.contains(args[0]) {
-                await captureCommand(args: args)
-            } else {
-                let zones = loadZones()
-                if zones[args[0]] != nil {
+            break
+        }
+
+        // Async commands — run on detached task, pump main RunLoop while waiting
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            switch args[0] {
+            case "capture":
+                await captureCommand(args: Array(args.dropFirst()))
+            default:
+                if knownTargets.contains(args[0]) {
                     await captureCommand(args: args)
                 } else {
-                    exitError("Unknown command or target: '\(args[0])'", code: "UNKNOWN_COMMAND")
+                    let zones = loadZones()
+                    if zones[args[0]] != nil {
+                        await captureCommand(args: args)
+                    } else {
+                        exitError("Unknown command or target: '\(args[0])'", code: "UNKNOWN_COMMAND")
+                    }
                 }
             }
+            done.signal()
+        }
+
+        // Keep main thread alive for AppKit work while async task runs
+        while done.wait(timeout: .now()) == .timedOut {
+            RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
         }
     }
 }

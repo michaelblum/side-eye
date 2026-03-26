@@ -1,0 +1,235 @@
+{
+  "name": "side-eye",
+  "version": "3.0.0",
+  "description": "Agent-first macOS screenshot CLI. Captures displays, windows, or regions with baked-in overlays (grids, bounding boxes) and returns structured JSON. All coordinates use a Local Coordinate System where (0,0) is the top-left of the captured target.",
+  "tools": [
+    {
+      "name": "side-eye-list",
+      "description": "Returns the current display topology as JSON, including display count, resolution, scale factor, arrangement, and the name of the active (frontmost) application.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "command": ["side-eye", "list"],
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "active_app": { "type": "string", "description": "Name of the frontmost application" },
+          "displays": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "integer", "description": "Ordinal display ID (1-based)" },
+                "type": { "type": "string", "enum": ["Main display", "Extended", "Mirror for Built-in Display"] },
+                "resolution": { "type": "string", "description": "WxH in logical points, e.g. '1512x982'" },
+                "scale_factor": { "type": "number", "description": "Retina scale factor (2.0 for Retina, 1.0 for standard)" },
+                "rotation": { "type": "number", "description": "Display rotation in degrees" },
+                "arrangement": { "type": "string", "enum": ["main", "left", "right", "center"], "description": "Physical position relative to the main display" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "side-eye-capture",
+      "description": "Takes a screenshot of a specific display, window, or region. Returns file paths or base64-encoded image data. IMPORTANT: All coordinates (--crop, --draw-rect, --grid) use the Local Coordinate System (LCS) where (0,0) is the top-left of the captured target, NOT the global macOS screen position. When using --crop or --draw-rect, specify pixel coordinates relative to the captured image, not global screen coordinates.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "What to capture. Use 'main' for the primary display, 'external' for the first external monitor, 'external 1'/'external 2' for specific externals by position, 'user_active' for the display with the focused app, 'selfie' for the display hosting this process, 'mouse' for the display under the cursor, 'all' for every display, or a saved zone name.",
+            "default": "main"
+          },
+          "window": {
+            "type": "boolean",
+            "description": "If true, capture only the targeted window instead of the full display. Window is captured with transparent background.",
+            "default": false
+          },
+          "out": {
+            "type": "string",
+            "description": "Output file path. Default: ./screenshot.<format>"
+          },
+          "base64": {
+            "type": "boolean",
+            "description": "If true, skip file I/O and return the image as a base64-encoded string in the JSON response. Ideal for sending screenshots directly to an LLM.",
+            "default": false
+          },
+          "crop": {
+            "type": "string",
+            "description": "Crop the captured image. Named styles: 'top-half', 'bottom-half', 'left-half', 'right-half', 'top-left', 'top-right', 'bottom-left', 'bottom-right', 'center'. Or exact pixel coordinates as 'x,y,w,h' in the Local Coordinate System (relative to captured target, NOT global screen)."
+          },
+          "format": {
+            "type": "string",
+            "enum": ["png", "jpg", "jpeg", "heic"],
+            "description": "Image format. PNG is lossless (larger), JPG/HEIC are lossy (smaller).",
+            "default": "png"
+          },
+          "quality": {
+            "type": "string",
+            "enum": ["high", "med", "low"],
+            "description": "Compression quality for lossy formats. high=1.0, med=0.6, low=0.3.",
+            "default": "high"
+          },
+          "show_cursor": {
+            "type": "boolean",
+            "description": "Include the system cursor in the captured image.",
+            "default": false
+          },
+          "highlight_cursor": {
+            "type": "string",
+            "description": "Draw a translucent 50px circle at the cursor position. Value is a hex color (#RRGGBB or #RRGGBBAA). Omit for no highlight."
+          },
+          "radius": {
+            "type": "integer",
+            "description": "Only with target='mouse'. Captures a box of <radius>*2 pixels centered on the cursor. The cursor will be at the center of the resulting image."
+          },
+          "interactive": {
+            "type": "boolean",
+            "description": "Show the native macOS crosshair selection UI. The human drags a rectangle and that region is captured. Returns bounds in the JSON response.",
+            "default": false
+          },
+          "wait_for_click": {
+            "type": "boolean",
+            "description": "Block until the human left-clicks, then capture. Returns click_x and click_y in the JSON response (in LCS coordinates). Requires Accessibility permission.",
+            "default": false
+          },
+          "timeout": {
+            "type": "number",
+            "description": "Timeout in seconds for --interactive and --wait-for-click. Returns a TIMEOUT error if exceeded.",
+            "default": 60
+          },
+          "delay": {
+            "type": "number",
+            "description": "Wait N seconds before capturing. Useful for menus, tooltips, or animations."
+          },
+          "clipboard": {
+            "type": "boolean",
+            "description": "Also copy the final image to the system clipboard.",
+            "default": false
+          },
+          "grid": {
+            "type": "string",
+            "description": "Overlay a coordinate grid onto the image. Format: 'COLSxROWS' (e.g., '10x10'). Grid lines are labeled with pixel coordinates in the LCS. Extremely useful for helping LLMs identify element positions."
+          },
+          "draw_rect": {
+            "type": "array",
+            "description": "Draw stroke bounding boxes on the image. Each item is an object with 'coords' (x,y,w,h string in LCS) and 'color' (#RRGGBB or #RRGGBBAA). Coordinates are in the Local Coordinate System, relative to the final image (post-crop).",
+            "items": {
+              "type": "object",
+              "properties": {
+                "coords": { "type": "string", "description": "x,y,w,h in LCS pixel coordinates" },
+                "color": { "type": "string", "description": "Hex color, e.g. #FF0000 or #FF000080" }
+              }
+            }
+          },
+          "draw_rect_fill": {
+            "type": "array",
+            "description": "Draw filled/translucent bounding boxes. Same format as draw_rect but boxes are filled instead of stroked.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "coords": { "type": "string" },
+                "color": { "type": "string" }
+              }
+            }
+          },
+          "thickness": {
+            "type": "number",
+            "description": "Stroke width in pixels for grid lines and rect borders. Increase for Retina displays.",
+            "default": 2
+          },
+          "shadow": {
+            "type": "string",
+            "description": "Drop shadow on all drawn elements. Format: 'offsetX,offsetY,blur,#color'. Example: '2,2,4,#00000080'. Helps overlays pop against busy backgrounds."
+          }
+        },
+        "required": []
+      },
+      "command_template": "side-eye capture {target} {flags}",
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "const": "success" },
+          "files": { "type": "array", "items": { "type": "string" }, "description": "File paths written (absent if --base64)" },
+          "base64": { "type": "array", "items": { "type": "string" }, "description": "Base64-encoded images (absent if not --base64)" },
+          "cursor": {
+            "type": "object",
+            "description": "Cursor position in LCS pixel coordinates (present when --highlight-cursor is used and cursor is in the captured area)",
+            "properties": { "x": { "type": "integer" }, "y": { "type": "integer" } }
+          },
+          "bounds": {
+            "type": "object",
+            "description": "Selection bounds in LCS pixels (present when --interactive is used)",
+            "properties": { "x": { "type": "integer" }, "y": { "type": "integer" }, "width": { "type": "integer" }, "height": { "type": "integer" } }
+          },
+          "click_x": { "type": "integer", "description": "Click X in LCS pixels (present when --wait-for-click)" },
+          "click_y": { "type": "integer", "description": "Click Y in LCS pixels (present when --wait-for-click)" },
+          "warning": { "type": "string", "description": "Non-fatal issue (e.g., window was minimized, fell back to display capture)" }
+        }
+      }
+    },
+    {
+      "name": "side-eye-zone-save",
+      "description": "Save a named spatial zone (a crop region on a specific display) for repeated capture.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Zone name (used as capture target later)" },
+          "target": { "type": "string", "description": "Display target (main, external, etc.)", "default": "main" },
+          "bounds": { "type": "string", "description": "Crop region as x,y,w,h in pixel coordinates" }
+        },
+        "required": ["name", "bounds"]
+      },
+      "command_template": "side-eye zone save {name} --target {target} --bounds {bounds}"
+    },
+    {
+      "name": "side-eye-zone-list",
+      "description": "List all saved zones as JSON.",
+      "inputSchema": { "type": "object", "properties": {}, "required": [] },
+      "command": ["side-eye", "zone", "list"]
+    },
+    {
+      "name": "side-eye-zone-delete",
+      "description": "Delete a saved zone by name.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Zone name to delete" }
+        },
+        "required": ["name"]
+      },
+      "command_template": "side-eye zone delete {name}"
+    }
+  ],
+  "error_codes": {
+    "PERMISSION_DENIED": "Screen recording permission not granted",
+    "ACCESSIBILITY_DENIED": "Accessibility permission not granted (needed for --wait-for-click)",
+    "NO_DISPLAY": "Cannot find or resolve the target display",
+    "NO_EXTERNAL_DISPLAY": "No external display connected",
+    "NO_WINDOW": "No suitable window found on the target display",
+    "NO_ACTIVE_APP": "No frontmost application detected",
+    "SELFIE_NOT_FOUND": "Cannot find the window of the process hosting side-eye",
+    "UNKNOWN_TARGET": "Target name not recognized and not a saved zone",
+    "UNKNOWN_COMMAND": "Command not recognized",
+    "UNKNOWN_OPTION": "Flag not recognized",
+    "INVALID_COLOR": "Hex color string is malformed (use #RRGGBB or #RRGGBBAA)",
+    "INVALID_CROP": "Crop style not recognized (use named style or x,y,w,h)",
+    "INVALID_ARG": "Argument value is invalid",
+    "INVALID_FORMAT": "Image format not recognized (use png, jpg, or heic)",
+    "INVALID_QUALITY": "Quality level not recognized (use high, med, or low)",
+    "MISSING_ARG": "Required argument not provided",
+    "MISSING_SUBCOMMAND": "Subcommand not specified",
+    "CAPTURE_FAILED": "ScreenCaptureKit capture operation failed",
+    "ENCODE_FAILED": "Image encoding failed",
+    "WRITE_FAILED": "File write failed",
+    "SELECTION_CANCELLED": "Interactive selection was cancelled or no region selected",
+    "TIMEOUT": "Interactive operation timed out",
+    "ZONE_NOT_FOUND": "Named zone does not exist",
+    "ZONE_WRITE_FAILED": "Failed to write zones file",
+    "INTERACTIVE_UNAVAILABLE": "Interactive overlay cannot acquire focus in this context"
+  }
+}
